@@ -1,0 +1,495 @@
+# app.py
+import os
+import sys
+print(f"🐍 Python version: {sys.version}")
+
+from flask import Flask, render_template, request, redirect, url_for, session, flash
+from database import *
+import json
+from datetime import datetime
+import sqlite3
+import threading
+
+# 🔴 TRY TO IMPORT PANDAS, BUT HANDLE ERROR
+try:
+    import pandas as pd
+    PANDAS_AVAILABLE = True
+    print("✅ Pandas available")
+except ImportError:
+    PANDAS_AVAILABLE = False
+    print("⚠️ Pandas not available, using fallback")
+    import csv
+
+app = Flask(__name__)
+app.secret_key = 'hmc-hostel-secret-key-2026'
+
+# 🔴 Database path for Render
+def get_db_path():
+    """Get database path - works on both local and Render"""
+    if os.environ.get('RENDER'):
+        return '/tmp/hostel_booking.db'
+    else:
+        return 'hostel_booking.db'
+
+# Override DB_NAME in database module
+import database
+database.DB_NAME = get_db_path()
+
+# ==================== HELPER FUNCTION ====================
+def update_csv():
+    """Auto update CSV file with latest database data"""
+    try:
+        # Set filepath based on environment
+        if os.environ.get('RENDER'):
+            filepath = '/tmp/hostel_data.csv'
+        else:
+            filepath = os.path.join(os.getcwd(), 'hostel_data.csv')
+        
+        conn = sqlite3.connect(get_db_path())
+        
+        if PANDAS_AVAILABLE:
+            # Use pandas if available
+            df = pd.read_sql_query("SELECT * FROM applications ORDER BY submitted_date DESC", conn)
+            
+            def get_guest_count(guest_details):
+                try:
+                    if guest_details and guest_details != '[]':
+                        guests = json.loads(guest_details)
+                        return len(guests)
+                    return 0
+                except:
+                    return 0
+            
+            df['guest_count'] = df['guest_details'].apply(get_guest_count)
+            conn.close()
+            df.to_csv(filepath, index=False)
+            print(f"✅ CSV Auto-Updated! Total records: {len(df)}")
+            return len(df)
+        else:
+            # Fallback: use csv module
+            cursor = conn.cursor()
+            cursor.execute("SELECT * FROM applications ORDER BY submitted_date DESC")
+            rows = cursor.fetchall()
+            
+            with open(filepath, 'w', newline='', encoding='utf-8') as f:
+                writer = csv.writer(f)
+                writer.writerow([i[0] for i in cursor.description])
+                writer.writerows(rows)
+            
+            conn.close()
+            print(f"✅ CSV Auto-Updated (csv module)! Total records: {len(rows)}")
+            return len(rows)
+            
+    except Exception as e:
+        print(f"⚠️ CSV update failed: {e}")
+        return 0
+
+def send_email_async(application, email_type='approval'):
+    """Send email in background thread"""
+    try:
+        from email_service import send_approval_email, send_rejection_email
+        
+        if email_type == 'approval':
+            send_approval_email(application)
+        elif email_type == 'rejection':
+            send_rejection_email(application)
+    except Exception as e:
+        print(f"⚠️ Email error: {e}")
+
+# ==================== MAIN ROUTES ====================
+
+@app.route('/')
+def index():
+    """Home page with Student Form and Admin Login buttons"""
+    return render_template('index.html')
+
+@app.route('/student-form')
+def student_form():
+    """Display the application form"""
+    return render_template('student_form.html', today=datetime.now().strftime('%Y-%m-%d'))
+
+@app.route('/submit-application', methods=['POST'])
+def submit_application():
+    """Handle form submission"""
+    try:
+        # Get form data
+        form_data = request.form.to_dict()
+        
+        # Handle "Others" option
+        if form_data.get('applicant_type') == 'Others':
+            other_text = request.form.get('other_applicant_type', '')
+            if other_text:
+                form_data['applicant_type'] = f"Others - {other_text}"
+        
+        # Get total guests count (max 4)
+        total_guests = int(request.form.get('total_guests', 0))
+        if total_guests > 4:
+            total_guests = 4
+        
+        # Collect guest details (up to 4 guests)
+        guest_list = []
+        for i in range(1, total_guests + 1):
+            name = request.form.get(f'guest_name_{i}')
+            if name and name.strip():
+                guest = {
+                    'name': name,
+                    'age_sex': request.form.get(f'guest_age_sex_{i}', ''),
+                    'guest_type': request.form.get(f'guest_type_{i}', 'Adult'),
+                    'nationality': request.form.get(f'guest_nationality_{i}', ''),
+                    'aadhaar': request.form.get(f'guest_aadhaar_{i}', ''),
+                    'contact': request.form.get(f'guest_contact_{i}', '')
+                }
+                guest_list.append(guest)
+        
+        # Insert into database
+        app_id = insert_application(form_data, guest_list)
+        
+        # AUTO CSV UPDATE
+        update_csv()
+        
+        flash(f'✅ Application submitted successfully! Application ID: {app_id}', 'success')
+        return redirect(url_for('index'))
+        
+    except Exception as e:
+        flash(f'❌ Error submitting application: {str(e)}', 'error')
+        return redirect(url_for('student_form'))
+
+@app.route('/admin-login', methods=['GET', 'POST'])
+def admin_login():
+    """Admin login page"""
+    if request.method == 'POST':
+        username = request.form.get('username')
+        password = request.form.get('password')
+        
+        if verify_admin(username, password):
+            session['admin_logged_in'] = True
+            session['admin_username'] = username
+            flash('✅ Login successful!', 'success')
+            return redirect(url_for('admin_dashboard'))
+        else:
+            flash('❌ Invalid username or password!', 'error')
+    
+    return render_template('admin_login.html')
+
+@app.route('/admin-dashboard')
+def admin_dashboard():
+    """Admin dashboard showing all applications"""
+    if not session.get('admin_logged_in'):
+        flash('Please login first!', 'error')
+        return redirect(url_for('admin_login'))
+    
+    applications = get_all_applications()
+    
+    # Debug print
+    print(f"\n{'='*50}")
+    print(f"📊 Admin Dashboard - Found {len(applications)} applications")
+    for app in applications:
+        print(f"   ID: {app['app_id']} | Name: {app['applicant_name']} | Status: {app['status']} | Room: {app.get('room_status', 'Booked')}")
+    print(f"{'='*50}\n")
+    
+    # Calculate counts
+    total = len(applications)
+    pending = len([a for a in applications if a['status'] == 'Pending'])
+    approved = len([a for a in applications if a['status'] == 'Approved'])
+    rejected = len([a for a in applications if a['status'] == 'Rejected'])
+    
+    # Get room status counts
+    room_stats = get_room_status_count()
+    
+    return render_template('admin_dashboard.html', 
+                         applications=applications,
+                         total=total,
+                         pending=pending,
+                         approved=approved,
+                         rejected=rejected,
+                         room_stats=room_stats)
+
+@app.route('/view-application/<int:app_id>')
+def view_application(app_id):
+    """View single application details"""
+    if not session.get('admin_logged_in'):
+        flash('Please login first!', 'error')
+        return redirect(url_for('admin_login'))
+    
+    application = get_application_by_id(app_id)
+    if not application:
+        flash('Application not found!', 'error')
+        return redirect(url_for('admin_dashboard'))
+    
+    # Parse guest details
+    guest_details = []
+    if application.get('guest_details'):
+        try:
+            guest_details = json.loads(application['guest_details'])
+        except:
+            guest_details = []
+    
+    return render_template('view_application.html', 
+                         application=application,
+                         guest_details=guest_details)
+
+@app.route('/approve-application/<int:app_id>')
+def approve_application(app_id):
+    """Approve application"""
+    if not session.get('admin_logged_in'):
+        flash('Please login first!', 'error')
+        return redirect(url_for('admin_login'))
+    
+    update_application_status(app_id, 'Approved', session['admin_username'])
+    
+    # 🔴 Send email notification in background 🔴
+    application = get_application_by_id(app_id)
+    if application and application.get('email'):
+        try:
+            email_thread = threading.Thread(target=send_email_async, args=(application, 'approval'))
+            email_thread.start()
+            email_sent = True
+        except Exception as e:
+            print(f"⚠️ Email thread error: {e}")
+            email_sent = False
+    else:
+        email_sent = False
+    
+    update_csv()
+    
+    if email_sent:
+        flash(f'✅ Application #{app_id} approved successfully! Email sent to {application.get("email")}', 'success')
+    else:
+        flash(f'✅ Application #{app_id} approved successfully! (Email could not be sent)', 'warning')
+    
+    return redirect(url_for('admin_dashboard'))
+
+@app.route('/reject-application/<int:app_id>')
+def reject_application(app_id):
+    """Reject application"""
+    if not session.get('admin_logged_in'):
+        flash('Please login first!', 'error')
+        return redirect(url_for('admin_login'))
+    
+    update_application_status(app_id, 'Rejected', session['admin_username'])
+    
+    # 🔴 Send rejection email in background 🔴
+    application = get_application_by_id(app_id)
+    if application and application.get('email'):
+        try:
+            email_thread = threading.Thread(target=send_email_async, args=(application, 'rejection'))
+            email_thread.start()
+            email_sent = True
+        except Exception as e:
+            print(f"⚠️ Email thread error: {e}")
+            email_sent = False
+    else:
+        email_sent = False
+    
+    update_csv()
+    
+    if email_sent:
+        flash(f'⚠️ Application #{app_id} rejected! Email sent to {application.get("email")}', 'info')
+    else:
+        flash(f'⚠️ Application #{app_id} rejected! (Email could not be sent)', 'warning')
+    
+    return redirect(url_for('admin_dashboard'))
+
+@app.route('/delete-application/<int:app_id>')
+def delete_application_route(app_id):
+    """Delete application"""
+    if not session.get('admin_logged_in'):
+        flash('Please login first!', 'error')
+        return redirect(url_for('admin_login'))
+    
+    delete_application(app_id)
+    update_csv()
+    
+    flash(f'🗑️ Application #{app_id} deleted!', 'info')
+    return redirect(url_for('admin_dashboard'))
+
+@app.route('/admin-logout')
+def admin_logout():
+    """Logout admin"""
+    session.clear()
+    flash('Logged out successfully!', 'success')
+    return redirect(url_for('index'))
+
+# ==================== CHECK-IN / CHECK-OUT ROUTES ====================
+
+@app.route('/check-in/<int:app_id>')
+def check_in(app_id):
+    """Check-in application - Guest arrives"""
+    if not session.get('admin_logged_in'):
+        flash('Please login first!', 'error')
+        return redirect(url_for('admin_login'))
+    
+    success, message = check_in_application(app_id, session['admin_username'])
+    
+    if success:
+        update_csv()
+        flash(f'🚪 {message} Room is now OCCUPIED.', 'success')
+    else:
+        flash(f'❌ {message}', 'error')
+    
+    return redirect(url_for('admin_dashboard'))
+
+@app.route('/check-out/<int:app_id>')
+def check_out(app_id):
+    """Check-out application - Guest leaves"""
+    if not session.get('admin_logged_in'):
+        flash('Please login first!', 'error')
+        return redirect(url_for('admin_login'))
+    
+    success, message = check_out_application(app_id)
+    
+    if success:
+        update_csv()
+        flash(f'🚪 {message} Room is now VACANT.', 'success')
+    else:
+        flash(f'❌ {message}', 'error')
+    
+    return redirect(url_for('admin_dashboard'))
+
+@app.route('/current-occupancy')
+def current_occupancy():
+    """Show current occupancy"""
+    if not session.get('admin_logged_in'):
+        flash('Please login first!', 'error')
+        return redirect(url_for('admin_login'))
+    
+    occupied_rooms = get_current_occupancy()
+    room_stats = get_room_status_count()
+    applications = get_all_applications()
+    
+    return render_template('current_occupancy.html', 
+                         occupied_rooms=occupied_rooms,
+                         room_stats=room_stats,
+                         applications=applications)
+
+# ==================== EXPORT CSV ====================
+
+@app.route('/export-csv')
+def export_csv():
+    """Manual CSV export with status page"""
+    try:
+        if os.environ.get('RENDER'):
+            filepath = '/tmp/hostel_data.csv'
+        else:
+            filepath = os.path.join(os.getcwd(), 'hostel_data.csv')
+        
+        conn = sqlite3.connect(get_db_path())
+        
+        if PANDAS_AVAILABLE:
+            df = pd.read_sql_query("SELECT * FROM applications ORDER BY submitted_date DESC", conn)
+            
+            def get_guest_count(guest_details):
+                try:
+                    if guest_details and guest_details != '[]':
+                        guests = json.loads(guest_details)
+                        return len(guests)
+                    return 0
+                except:
+                    return 0
+            
+            df['guest_count'] = df['guest_details'].apply(get_guest_count)
+            conn.close()
+            df.to_csv(filepath, index=False)
+            total_records = len(df)
+        else:
+            import csv
+            cursor = conn.cursor()
+            cursor.execute("SELECT * FROM applications ORDER BY submitted_date DESC")
+            rows = cursor.fetchall()
+            
+            with open(filepath, 'w', newline='', encoding='utf-8') as f:
+                writer = csv.writer(f)
+                writer.writerow([i[0] for i in cursor.description])
+                writer.writerows(rows)
+            
+            conn.close()
+            total_records = len(rows)
+        
+        return f"""
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <title>CSV Export - HMC Hostel</title>
+            <style>
+                body {{ font-family: Arial; text-align: center; padding: 50px; background: #f5f6fa; }}
+                .success {{ background: #d4edda; color: #155724; padding: 20px; border-radius: 10px; }}
+                .btn {{ background: #3498db; color: white; padding: 10px 20px; text-decoration: none; border-radius: 5px; }}
+            </style>
+        </head>
+        <body>
+            <div class="success">
+                <h2>✅ CSV Export Successful!</h2>
+                <p><strong>File:</strong> {filepath}</p>
+                <p><strong>Total Records:</strong> {total_records}</p>
+            </div>
+            <a href="/admin-dashboard" class="btn">← Back to Dashboard</a>
+            <a href="/" class="btn" style="background: #27ae60;">🏠 Home</a>
+        </body>
+        </html>
+        """
+    except Exception as e:
+        return f"""
+        <h2>❌ CSV Export Failed</h2>
+        <p>Error: {str(e)}</p>
+        <a href="/admin-dashboard">← Back to Dashboard</a>
+        """
+
+# ==================== BULK DATA ADD ====================
+
+@app.route('/add-bulk-data')
+def add_bulk_data():
+    """Add sample applications for demo"""
+    if not session.get('admin_logged_in'):
+        flash('Please login first!', 'error')
+        return redirect(url_for('admin_login'))
+    
+    try:
+        import random
+        
+        names = ['Dr. Rajesh Kumar', 'Prof. Suresh Verma', 'Ms. Priya Singh']
+        types = ['Serving DRDO', 'Retired DRDO', 'Other Govt Emp.']
+        purposes = ['Research Meeting', 'Conference', 'Training Program']
+        
+        conn = sqlite3.connect(get_db_path())
+        cursor = conn.cursor()
+        
+        count = 0
+        for i in range(5):
+            status = 'Approved' if i < 3 else 'Pending'
+            cursor.execute('''
+                INSERT INTO applications (
+                    applicant_name, applicant_type, mobile, email, purpose,
+                    from_date, to_date, rooms_required, messing_required, status
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ''', (
+                random.choice(names),
+                random.choice(types),
+                f'98{random.randint(10000000, 99999999)}',
+                f'user{i}@drdo.in',
+                random.choice(purposes),
+                f'{random.randint(1,28)}-03-2026 10:00',
+                f'{random.randint(1,28)}-03-2026 17:00',
+                random.choice([1, 2]),
+                random.choice(['Yes', 'No']),
+                status
+            ))
+            count += 1
+        
+        conn.commit()
+        conn.close()
+        update_csv()
+        
+        flash(f'✅ Added {count} sample applications!', 'success')
+        
+    except Exception as e:
+        flash(f'❌ Error: {str(e)}', 'error')
+    
+    return redirect(url_for('admin_dashboard'))
+
+if __name__ == '__main__':
+    port = int(os.environ.get('PORT', 5000))
+    print("🚀 HMC Hostel Booking System Starting...")
+    print(f"📍 URL: http://0.0.0.0:{port}")
+    print("👑 Admin: admin / admin123")
+    print("="*50)
+    app.run(debug=False, host='0.0.0.0', port=port)
